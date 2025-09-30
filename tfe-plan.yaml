@@ -1,0 +1,156 @@
+name: TFE Infrastructure CI Template
+on:
+  workflow_call:
+    inputs:
+      env_branch:
+        description: 'Environment branch'
+        required: true
+        type: string
+      module:
+        description: 'Module to Deploy'
+        required: true
+        type: string
+      secret_environment:
+        description: 'GitHub Secret Environment Name'
+        required: true
+        type: string
+
+jobs:
+  Terraform-Plan:
+    runs-on: 'GM-SDV-PROD-Ubuntu-24.04-64'
+    environment: ${{ inputs.secret_environment }}
+    env:
+      VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+      VAULT_ROLE: ${{ vars.APP_DEPLOYERS_ROLE }}
+      VAULT_NAMESPACE: ${{ vars.VAULT_NAMESPACE }}
+      VAULT_PATH: ${{ vars.VAULT_JWT_GHA_BACKEND_PATH }}
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.1
+        with:
+          ref: ${{ inputs.env_branch }}
+      - name: Retrieve Dynamic Secret
+        id: retrieve-secrets
+        uses: GM-InnerSource/ccoe-205219-az-dynamic-vault-creds-action@v1.0.1
+        with:
+          vault_auth_path: ${{ env.VAULT_PATH }}
+          vault_role: ${{ env.VAULT_ROLE }}
+          vault_address: ${{ env.VAULT_ADDR }}
+          vault_namespace: ${{ env.VAULT_NAMESPACE }}
+      - name: Set Var for TF_Module
+        run: echo "TF_VAR_ARM_SUBSCRIPTION_ID=${{ vars.SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ steps.retrieve-secrets.outputs.client_id }}",
+              "clientSecret": "${{ steps.retrieve-secrets.outputs.client_secret }}",
+              "subscriptionId": "${{ vars.SUBSCRIPTION_ID }}",
+              "tenantId": "${{ vars.TENANT_ID }}"
+            }
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.10.0
+          cli_config_credentials_token: ${{ secrets.TFE_TOKEN }}
+          terraform_wrapper: false
+      - name: Install Terragrunt
+        run: |
+          wget https://github.com/gruntwork-io/terragrunt/releases/download/v0.38.7/terragrunt_linux_amd64
+          mv terragrunt_linux_amd64 terragrunt && chmod a+x terragrunt
+          ./terragrunt -v
+          echo "PATH=`pwd`:$PATH" >> $GITHUB_ENV
+      - name: Set ARM env variables
+        run: |
+          echo "export ARM_SUBSCRIPTION_ID=${{ vars.SUBSCRIPTION_ID }}" > ARMVARS
+          chmod +x ARMVARS
+      - name: Set github HTTPS creds
+        run: |
+          git config --global --add credential.helper store
+          echo "https://${GIT_USERNAME}:${GITCHECKOUT_TOKEN}@github.com" >>~/.git-credentials
+        env:
+          GIT_USERNAME: 'SI-NAM-219775-P-SDV_gme'
+          GITCHECKOUT_TOKEN: ${{ secrets.CD_BOOTSTRAP_TOKEN_SGM }}
+      - name: Terraform Plan
+        id: plan
+        run: |
+          . ./ARMVARS
+          pushd $SUBFOLDER
+          PLAN_PATH="$(pwd)/plan.txt"
+          terragrunt plan --terragrunt-non-interactive --terragrunt-include-external-dependencies -out "$(pwd)/tfplan"
+          terragrunt show -no-color "$(pwd)/tfplan" > "$PLAN_PATH"
+          echo "PLAN_PATH=$PLAN_PATH" >> $GITHUB_ENV 
+          popd
+          rm -f ~/.git-credentials
+          git config --global --remove-section credential
+        env:
+          SUBFOLDER: ${{ inputs.module }}
+      # - name: Terraform Plan
+      #   id: plan
+      #   run: |
+      #     . ./ARMVARS
+      #     pushd $SUBFOLDER
+      #     PLAN_PATH="$(pwd)/plan.txt"
+      #     terragrunt plan --terragrunt-non-interactive --terragrunt-include-external-dependencies 2>&1 | tee "$PLAN_PATH"
+      #     echo "PLAN_PATH=$PLAN_PATH" >> $GITHUB_ENV 
+      #     popd
+      #     rm -f ~/.git-credentials
+      #     git config --global --remove-section credential
+      #   env:
+      #     SUBFOLDER: ${{ inputs.module }}
+      - name: Display the plan summary
+        id: display
+        env:
+          PLAN_PATH: ${{ env.PLAN_PATH }}
+        run: |
+          {
+            awk '/No changes. No objects need to be destroyed./ {
+              print "## " $0
+              print "Either you have not created any objects yet or the existing objects were already deleted outside of Terraform."
+              exit
+            }' "$PLAN_PATH"
+          
+            awk '/Terraform will perform the following actions:/ {
+              print "## Terraform will perform the following actions:"
+              print "|Action|Resource|"
+              print "|------|--------|"
+              exit
+            }' "$PLAN_PATH"
+          
+            awk '/Terraform used the selected/{ next } /will be/ || /must be/ {print "|" $5 "|" $2 "|"; next} /Plan:/{ print "## " $0; next }' "$PLAN_PATH" \
+              | sed -e 's/created/:white_check_mark: create/' -e 's/destroyed/:bangbang: destroy/' -e 's/replaced/:recycle: replace/'
+          } > plan.md
+          cat plan.md >> $GITHUB_STEP_SUMMARY
+      - name: Plan PR Comment
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |      
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+      
+            <details><summary>Show Plan</summary>
+      
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+      
+            </details>
+      
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.tf_actions_working_dir }}\`, Workflow: \`${{ github.workflow }}\`*`;
+      
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
