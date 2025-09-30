@@ -1,0 +1,151 @@
+name: Deploy to AKS
+
+on:
+  workflow_call:
+    inputs:
+      secret_environment:
+        description: 'GitHub Secret Environment Name'
+        required: true
+        type: string
+      aks_resource_group_name:
+        description: 'AKS Resource Group Name'
+        required: true
+        type: string
+      aks_cluster_name:
+        description: 'AKS Cluster Name'
+        required: true
+        type: string
+      aks_image_tag:
+        description: 'AKS Image Tag'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  Deploy:
+    runs-on: GM-SDV-PROD-Ubuntu-24.04-64
+    environment: ${{ inputs.secret_environment }}
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+      VAULT_ROLE: ${{ vars.APP_DEPLOYERS_ROLE }}
+      VAULT_NAMESPACE: ${{ vars.VAULT_NAMESPACE }}
+      VAULT_PATH: ${{ vars.VAULT_JWT_GHA_BACKEND_PATH }}
+      ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+      ACR_REPOSITORY: ${{ vars.ACR_REPOSITORY }}
+      ACR_IMAGE_NAME: ${{ vars.ACR_IMAGE_NAME }}
+      ACR_SERVER: ${{ vars.ACR_SERVER }}
+      SUBSCRIPTION_ID: ${{ vars.SUBSCRIPTION_ID }}
+      TENANT_ID: ${{ vars.TENANT_ID }}
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Retrieve Dynamic Secret
+      id: retrieve-secrets
+      uses: GM-InnerSource/ccoe-205219-az-dynamic-vault-creds-action@v1.0.1
+      with:
+        vault_auth_path: ${{ env.VAULT_PATH }}
+        vault_role: ${{ env.VAULT_ROLE }}
+        vault_address: ${{ env.VAULT_ADDR }}
+        vault_namespace: ${{ env.VAULT_NAMESPACE }}
+    
+    - name: Set Var for TF_Module
+      run: echo "TF_VAR_ARM_SUBSCRIPTION_ID=${{ env.SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+    
+    # - name: Azure login
+    #   uses: azure/login@v2
+    #   with:
+    #     creds: |
+    #       {
+    #         "clientId": "${{ steps.retrieve-secrets.outputs.client_id }}",
+    #         "clientSecret": "${{ steps.retrieve-secrets.outputs.client_secret }}",
+    #         "subscriptionId": "${{ env.SUBSCRIPTION_ID }}",
+    #         "tenantId": "${{ env.TENANT_ID }}"
+    #       }
+
+    - name: Azure login
+      shell: bash
+      run: |
+        for i in {1..3}; do
+          echo "🔐 Attempt $i to login to Azure..."
+          az login --service-principal \
+            --username "${{ steps.retrieve-secrets.outputs.client_id }}" \
+            --password "${{ steps.retrieve-secrets.outputs.client_secret }}" \
+            --tenant "${{ vars.TENANT_ID }}" \
+            --output none && break
+
+          echo "❌ Login attempt $i failed."
+          if [[ $i -eq 3 ]]; then
+            echo "💥 All attempts failed."
+            exit 1
+          fi
+          sleep 5
+        done
+
+    
+    - uses: azure/aks-set-context@v4
+      with:
+        resource-group: ${{ inputs.aks_resource_group_name }}
+        cluster-name: ${{ inputs.aks_cluster_name }}
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+
+    - name: Install Kustomize
+      run: |
+        curl -sfLo kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.3.0/kustomize_v5.3.0_linux_amd64.tar.gz
+        tar -zxvf kustomize.tar.gz
+        chmod +x kustomize
+        sudo mv kustomize /usr/local/bin/
+
+    - name: Set image tag with Kustomize
+      run: |
+        cd infra/k8s/base
+        kustomize edit set image ${{ env.ACR_IMAGE_NAME }}=${{ env.ACR_SERVER }}/${{ env.ACR_REPOSITORY }}/${{ env.ACR_IMAGE_NAME }}:${{ inputs.aks_image_tag }}
+        cat kustomization.yaml
+
+    - name: Deploy to AKS
+      run: |
+        cd infra/k8s/base
+        kubectl apply -k ./
+
+    - name: ⏳ Wait for all deployments to roll out
+      shell: bash
+      if: false
+      run: |
+        set -e
+        cd infra/k8s/base
+
+        echo "🔍 Fetching deployments across all namespaces..."
+        DEPLOYMENTS=$(kustomize build . | kubectl get -f - -o json | jq -r '.items[] | select(.kind=="Deployment") | "\(.metadata.namespace // "default")::\(.metadata.name)"')
+
+        echo "📋 Found deployments:"
+        echo "$DEPLOYMENTS"
+
+        if [ -z "$DEPLOYMENTS" ]; then
+          echo "⚠️ No deployments found in any namespace."
+          exit 1
+        fi
+
+        while IFS="::" read -r namespace deploy; do
+          echo "⏳ Waiting for deployment/$deploy in namespace/$namespace to roll out..."
+          kubectl rollout status deployment/"$deploy" -n "$namespace" --timeout=120s || {
+            echo "❌ Deployment $deploy in namespace $namespace failed to roll out."
+            exit 1
+          }
+        done <<< "$DEPLOYMENTS"
+
+        echo "✅ All deployments rolled out successfully."
+
+
